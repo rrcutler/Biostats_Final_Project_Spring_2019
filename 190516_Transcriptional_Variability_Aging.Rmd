@@ -9,8 +9,607 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-# Load data 
+The purpose of this is to use methods developed in, Kedlian, V. R., Donertas, H. M., & Thornton, J. M. (2019). The widespread increase in inter-individual variability of gene expression in the human brain with age. Aging, 11(8). https://doi.org/10.18632/aging.101912, and apply them to the datasets presented in Benayoun, B. A., Pollina, E. A., Singh, P. P., Mahmoudi, S., Harel, I., Casey, K. M., … Brunet, A. (2019). Remodeling of epigenome and transcriptome landscapes with aging in mice reveals widespread induction of inflammatory responses. Genome Research, 29(4), 697–709. https://doi.org/10.1101/gr.240093.118.
+
+## Load libraries
 ```{r}
-load
+colors <- c("#A7A7A7",
+ "dodgerblue",
+ "firebrick",
+ "forestgreen",
+ "gold")
+
+library(DESeq2)
+library(affy)
+library(ggplot2)
+library(vsn)
+library(ggrepel)
+library(factoextra)
+library(FactoMineR)
+library(genefilter)
+library(fdrtool)
+library(reshape2)
+library(RColorBrewer)
+library(sva)
 ```
+
+
+## Load data 
+Filter featureCounts tables to remove everything but counts and Geneid 
+```{r}
+ob_data <- read.table("/Users/refrigerator/Documents/School/UTHSCSA/Spring_2019/Bioinformatics/Final_Project/Mouse_Aging_Epigenomics_2018-master/Figure1_General/RNA_Mapping_counting_DE/count_matrices/Aging_OlfactoryBulb_counts_genes.txt", header = TRUE, row.names = 1)
+ob_data <- ob_data[,-(1:5)]
+```
+
+1. USe SVA for unsupervised estimation of covariates from the data and include this in regression model 
+
+2. Start out with normal differential expression analysis 
+```{r}
+# the different names for the samples
+colnames(ob_data) <- c("OB_3m3", "OB_3m2","OB_3m1", "OB_12m1","OB_12m3", "OB_29m3", "OB_29m2", "OB_29m1") 
+
+# Convert to matrix
+countdata <- as.matrix(ob_data)
+head(ob_data)
+
+# different ages as independent variables
+ob_ages <- factor(c(3,3,3,12,12,29,29,29)) 
+
+# Create a coldata frame and instantiate the DESeqDataSet
+(coldata <- data.frame(row.names=colnames(ob_data), ob_ages))
+
+# read the count data from the matrix into a DESeq object with a design to test the effects of time
+dds <- DESeqDataSetFromMatrix(countData=ob_data, colData=coldata, design=~ob_ages)
+```
+
+## Proportion of low counts 
+Percentage of counts less than 10 per sample.
+```{r}
+# for each column (sample) count the number of counts less than or equal to ten, get the proportion with the mean() function, and then multiply this by 100
+proportion_10 <- apply(counts(dds), MARGIN = 2, function(x) 100*mean(x<= 10))
+
+# plot a barplot where the colors correspond to the condition
+barplot(proportion_10,
+        horiz = TRUE,
+        las = 1,
+        cex.names = 0.5,
+        col = colors[colData(dds)$ob_ages],
+       ylab='Samples',
+       xlab='% of counts less than 10',
+       main="Percentage of counts less than 10 per sample")
+```
+
+## Filtering low counts 
+This filters out genes which have less than 10 read counts when summed across all conditions. This is an arbitrary but minimal count filter. We see that 528 genes were filtered out using this threshold. It is interesting that this filtering does not appear to change the percentage of counts < 10/sample.
+```{r}
+# length before
+before_len <- length(row.names(dds))
+
+# filtering
+dds_filter <- dds[rowSums(counts(dds)) >= 10]
+
+# length after
+after_len <- length(row.names(dds_filter))
+
+# amount filtered
+before_len - after_len
+
+# plot before and after length
+barplot(c(before_len, after_len), xlab = "Filtering", ylab = "Amount of genes", col = colors)
+
+# for each column (sample) count the number of counts less than or equal to ten, get the proportion with the mean() function, and then multiply this by 100
+proportion_10 <- apply(counts(dds_filter), MARGIN = 2, function(x) 100*mean(x<= 10))
+
+# plot a barplot where the colors correspond to the condition
+barplot(proportion_10,
+        horiz = TRUE,
+        las = 1,
+        cex.names = 0.5,
+        col = colors[colData(dds)$ob_ages],
+       ylab='Samples',
+       xlab='% of counts less than 10',
+       main="Percentage of counts less than 10 per sample")
+```
+
+
+## Count distribution before normalization
+Plotting the distirbution of counts on the log2 scale. We see here that the count distribution is very low for T120, indicating that it has mostly low counts for all genes because phage transcription has now taken over in a small subset of highly expressed genes as compared to the many lowly expressed bacterial genes.
+```{r}
+
+# plotting an unnormalized density plot of the log transformed counts 
+plotDensity(log2(counts(dds_filter) + 1),
+            lty=1,
+            col=colors[colData(dds)$ob_ages],
+            lwd=1,
+            xlab = "log2(Counts + 1)", 
+            main = "Unnormalized Counts")
+legend("topright",
+       legend=levels(colData(dds)$ob_ages),
+       lwd=1, col = colors)
+
+# plotting an unnormalized box plot of the log transformed counts 
+boxplot(log2(counts(dds_filter) + 1),
+        col = colors[colData(dds)$ob_ages],
+        cex.axis = 0.5,
+        las = 1,
+        horizontal = TRUE,
+        xlab = "log2(Counts + 1)",
+        ylab = "Samples",
+        main = "Unnormalized Counts")
+```
+
+## Running DESeq
+First we set our reference level to 3 months of age, as this is the age we will be making comparisons against. Then, we simply run DESeq using the DESeq() function. This will estimate the size factors to normalize counts between samples, estimate dispersion parameters and perform dispersion shrinkage, and finally test for differential expression using the wald test with independent filtering to alleviate benjamini-hochberg multiple hypothesis correction.
+```{r}
+# set T0
+dds_filter$ob_ages <- relevel(dds_filter$ob_ages, ref = "3")
+
+# Run DESeq
+dds_filter <- DESeq(dds_filter)
+```
+
+## Count distribution after normalization
+We do this to make sure the normalization is working as expected.
+```{r}
+# density plot normalized
+plotDensity(log2(counts(dds_filter, normalized = TRUE) + 1),
+            lty=1,
+            col=colors[colData(dds_filter)$ob_ages],
+            lwd=1,
+            xlab = "log2(Counts + 1)",
+            main = "Normalized Counts")
+legend("topright",
+       legend=levels(colData(dds_filter)$ob_ages),
+       lwd=1, col = colors)
+
+# box plot normalized
+boxplot(log2(counts(dds_filter, normalized = TRUE) + 1),
+        col = colors[colData(dds_filter)$ob_ages],
+        cex.axis = 0.5,
+        las = 1,
+        horizontal = TRUE,
+        xlab = "log2(Counts + 1)",
+        ylab = "Samples",
+        main = "Normalized Counts")
+legend("topright",
+       legend=levels(colData(dds)$ob_ages),
+       lwd=1, col = colors)
+```
+
+## Mean Variance Relationship
+Plotting the mean and variance to examine whether the data appears to have a non-linear relationship between the variance and mean which would support the use of a negative binomial distribution to model read counts. This is done by comparing the mean-variance plot to a linear line. Here we can see that our data does indeed increase in varaince as the mean increases in a non-linear fashion.
+```{r}
+## Computing mean and variance
+norm.counts <- counts(dds_filter, normalized=TRUE) 
+mean.counts <- rowMeans(norm.counts)
+variance.counts <- apply(norm.counts, MARGIN = 1, var)
+
+## Mean and variance relationship
+mean.var.col <- densCols(x=log2(mean.counts), y=log2(variance.counts)) 
+
+plot(x=log2(mean.counts), y=log2(variance.counts), pch=16, cex=0.5,
+col=mean.var.col, main="Mean-variance relationship", xlab="Mean log2(normalized counts) per gene", ylab="Variance of log2(normalized counts)", panel.first = grid())
+
+abline(a=1, b=1, col="red")
+```
+
+##Estimation of Dispersion 
+This gives us a feel for what the dispersion parameter is in our model and what the effect of dispersion shrinkage is. We see that there are 112 dispersion shrinkage outliers which will keep their original dispersions before shrinkage.
+```{r}
+plotDispEsts(dds_filter)
+sum(mcols(dds_filter,use.names=TRUE)[,"dispOutlier"])
+```
+
+## Transform normalized counts to stabalize mean-variance for clustering
+Using two transformations in order to stabalize the mean-variance relationship in order to minimize the influence of genes with low read counts when performing unsupervised analysis. We use the blind = FALSE parameter to indicate to take into account our design when transforming counts.
+1. regularized log
+2. variance stabalizing transformation
+```{r}
+dds_rlog <- rlog(dds_filter, blind = FALSE)
+dds_vst <- vst(dds_filter, blind = FALSE)
+```
+
+Log2 transformed counts just for comparison. We can see that this does not stabalize the mean-variane relationship. 
+```{r}
+dds_log2 <- log2(counts(dds_filter) + 1)
+meanSdPlot(dds_log2)
+```
+
+Compare rlog and vst transformations. We choose to use the rlog transformation here as the line appear to be more horizontal than the VST fitted line. We notice there are still many outliers which where the transformation could not correct for the mean-variance relationship, especially when normalized counts increased. 
+```{r}
+meanSdPlot(assay(dds_rlog))
+meanSdPlot(assay(dds_vst))
+```
+
+## Principle Component Analysis
+PCA clustering function. For input this requires the number of genes we want to use and the stablized mean-variance object (VST or rlog).
+```{r}
+# PCA plot of samples
+PCAPlotter <- function(ntop, vsd, shape) {
+  # getting most variable genes 
+  Pvars <- rowVars(assay(vsd))
+  select <- order(Pvars, decreasing = TRUE)[seq_len(min(ntop, 
+          length(Pvars)))]
+  sampleNO <- rownames(colData(vsd))
+
+  # calculate pca - zero centering variables and scaling where all   variables have unit variance
+  PCA <- prcomp(t(assay(vsd)[select, ]), scale = T, center = TRUE)
+  percentVar <- round(100*PCA$sdev^2/sum(PCA$sdev^2),1)
+  dataGG = data.frame(PC1 = PCA$x[,1], PC2 = PCA$x[,2], 
+                      PC3 = PCA$x[,3], PC4 = PCA$x[,4], 
+                      condition = colData(vsd)$ob_ages)
+  # plotting
+  print(ggplot(data = dataGG) +
+        geom_point(data = dataGG, mapping = aes(x = PC1, y = PC2, color =  condition, shape = shape), size = 6) +
+        scale_shape_identity() +
+  	    labs(title = paste("PC1 vs PC2, Top", toString(ntop), "Variable Genes"),
+        x = paste0("PC1: ", round(percentVar[1],4), "%"),
+        y = paste0("PC2: ", round(percentVar[2],4), "%")) +
+  	    scale_colour_brewer(type="qual", palette=2) +
+  	    theme_classic() +
+  	    scale_color_discrete(name = "Age (months)") +
+  	    theme(axis.text = element_text(size = 15),
+  	    legend.box = "horizontal",
+        axis.title.y = element_text(size = 15, face = "bold"),
+        axis.title.x = element_text(size = 15, face = "bold"),
+        legend.text = element_text(size = 10),
+        legend.title = element_text(size = 12, face = "bold"),
+        legend.background = element_blank(),
+        legend.box.background = element_rect(colour = "black"),
+        legend.position = "top") +
+  	    geom_label_repel(aes(label = sampleNO, x = PC1, y = PC2), color = "black") +
+        guides(colour = guide_legend(override.aes = list(shape = shape))))
+                                     
+  PCA$rotation
+  PCA$sdev
+  return(PCA)
+}
+```
+
+### Bacteria + Bacteriophage PCA Plots
+PCA Plot using the combined bacteria and bacteriophage gene expression. We choose the PCA plot to further analyze where the graph has stabalized, which appears to be when using the top 5000 variable genes. It appears here that the labeling of our samples is good and that the replicates appear to have similar profiles to each other as expected. Interestingly the T0 replicates appear to be the most distant as compared to other time points, which could suggest variaibility in transcription before the infection.
+```{r}
+PCA <- PCAPlotter(500, dds_rlog, 15)
+PCA <- PCAPlotter(1000, dds_rlog, 15)
+PCA <- PCAPlotter(5000, dds_rlog, 15)
+PCA <- PCAPlotter(length(row.names(dds_filter)), dds_rlog, 15)
+```
+
+Plot of eigenvalues for each PCA showing how much each account for total variance. We are able to see how much each total variance each dimensions accounts for, which genes explain the greatest variance within each dimension, and which samples are the greatest influencers on each dimension.
+```{r}
+PCA <- PCAPlotter(5000, dds_rlog, 15)
+
+# get importance of each component
+fviz_eig(PCA, addlabels = TRUE)
+
+var <- get_pca_var(PCA)
+# contributions of individual genes to each PC
+fviz_contrib(PCA, choice = "var", axes = 1, top = 20, rotate = TRUE, sort.val = "asc")
+fviz_contrib(PCA, choice = "var", axes = 2, top = 20, rotate = TRUE, sort.val = "asc")
+
+# contributions of individual samples to each PC 
+fviz_contrib(PCA, choice = "ind", axes = 1, top = 20, rotate = TRUE, sort.val = "asc")
+fviz_contrib(PCA, choice = "ind", axes = 2, top = 20, rotate = TRUE, sort.val = "asc")
+```
+
+## SVA Surrogate covariate estimation default
+Using the SVA package in order to estimate surrogate covariates that will attempt to remove batch effects and other unwanted variation. We include our condition design here because we do not want to remove variation associated with this effect. Note that SVA was not used in the original analysis by Benayoun et al 2019. 
+```{r}
+# Loading all variables 
+dat  <- counts(dds_filter, normalized = TRUE)
+idx  <- rowMeans(dat) > 1
+dat  <- dat[idx, ]
+mod  <- model.matrix(~ ob_ages, colData(dds))
+mod0 <- model.matrix(~ 1, colData(dds))
+svseq_default <- svaseq(dat, mod, mod0)
+```
+
+Plotting the surrogate variables for each sample. Here we can see a general direction each sample will move in after using the covariate to normalize for counts. The further away from zero the more extreme the normalization. We can also see the grouping of the samples based on unwanted variation.
+```{r}
+plot(svseq_default$sv, pch = 19, col = "blue")
+text(svseq_default$sv, labels=rownames(colData(dds_vst)), cex= 0.7)
+```
+
+Adding surrogate variables to the DESEq2 design and re-testing for differential expression against the batches in order to compare to the original DE test. The amount of surrogate variables here will vary.
+```{r}
+# create a new deseq2 object which uses the surrogate variables 
+ddssva_default <- dds_filter
+
+# add each surrogate vriable to the design and update the design
+ddssva_default$SV1 <- svseq_default$sv[,1]
+ddssva_default$SV2 <- svseq_default$sv[,2]
+design(ddssva_default) <- ~ SV1 + SV2 + ob_ages
+
+# Run DESeq
+ddssva_default$condition <- relevel(ddssva_default$ob_ages, ref = "3")
+ddssva_default <- DESeq(ddssva_default)
+```
+
+# Differential Expression Results
+
+## Results Names
+This allows us to look at all the comparisons that were made between the reference. We will use these names when extracting results using the results() function.
+```{r}
+resultsNames(ddssva_default)
+```
+
+Write output function for results table to csv. Make sure that the directory, "dir" is set!
+The output function takes as input: results object, DESeq object, timepoint of comparison, vector of conditions being compared, output directory
+```{r}
+writeOutput <- function(res, dds, stage, cond, dir) {
+  resOrdered <- res[order(res$padj),]
+  resdata <- merge(as.data.frame(resOrdered), as.data.frame(counts(dds, normalized=TRUE)), by="row.names", sort=FALSE, all = TRUE) #includes normalized counts in output csv
+  names(resdata)[1] <- "Gene" # set header of first column
+  outfile <- paste(cond[1], cond[length(cond)], stage, "DESeq2.csv", sep = "_")
+  outfile <- paste(dir, outfile, sep = "")
+  write.csv(as.data.frame(resdata), file = outfile, row.names = FALSE)
+}
+
+# setting output dir
+dir <- "/Users/refrigerator/Documents/School/UTHSCSA/Spring_2019/Bioinformatics/Final_Project/DESeq2_Output/"
+```
+
+## 3 months vs 12 months
+Using original model
+```{r}
+# Extract the 3 months vs 12 months result using an alpha threshold of 0.05
+res_3_12 <- results(dds_filter, alpha = 0.05, name = "ob_ages_12_vs_3")
+
+# p-value distribution histogram
+hist(res_3_12$pvalue, main = "P-value distribution 3 months vs 12 months", xlab = "P-value", ylab = "Frequency", col = "lavender")
+
+# get shrunken fold change
+res <- lfcShrink(dds_filter, contrast = c("ob_ages", "3", "12"), type="normal")
+
+# get a summary of the amount of significantly differentially expressed genes 
+summary(res_3_12, alpha = 0.05)
+    
+# write the results
+writeOutput(res_3_12, dds_filter, "Olfactory_bulb_lfcShrink", c("3", "12"), dir)
+```
+
+Using SVA corrected model
+```{r}
+# Extract the 3 months vs 12 months result using an alpha threshold of 0.05
+res_3_12 <- results(ddssva_default, alpha = 0.05, name = "ob_ages_12_vs_3")
+
+# p-value distribution histogram
+hist(res_3_12$pvalue, main = "P-value distribution 3 months vs 12 months", xlab = "P-value", ylab = "Frequency", col = "lavender")
+
+# get shrunken fold change
+res <- lfcShrink(ddssva_default, contrast = c("ob_ages", "3", "12"), type="normal")
+
+# get a summary of the amount of significantly differentially expressed genes 
+summary(res_3_12, alpha = 0.05)
+    
+# write the results
+#writeOutput(res_3_12, ddssva_default, "Olfactory_bulb_lfcShrink", c("3", "12"), dir)
+```
+
+P-value correction on 3 months vs 12 months with SVA model. Doing this because p-val histogram is skewed to the right.
+Clear out genes that were removed via independent filtering, clear out padj values, Re-estimate p-values using z-score
+```{r}
+# save these to append later
+padj_save <- res_3_12[is.na(res_3_12$padj),]
+pvalue_save <- padj_save[is.na(padj_save$pvalue),]
+
+# remove genes filtered out by independent filtering
+res_3_12 <- res_3_12[!is.na(res_3_12$padj),]
+res_3_12 <- res_3_12[!is.na(res_3_12$pvalue),]
+# remove all adjusted pvalues, will replace later
+res_3_12 <- res_3_12[, -which(names(res_3_12) == "padj")]
+# get z-scores_3_12 as input to fdrtool to re-estimte p-values
+FDR.res_3_12 <- fdrtool(res_3_12$stat, statistic = "normal", plot = T)
+# calculate new padj values using BH correction
+res_3_12[, "padj"] <- p.adjust(FDR.res_3_12$pval, method = "BH")
+# put new pvals in res_3_12 object
+res_3_12$pvalue <- FDR.res_3_12$pval
+
+# summary before binding
+summary(res_3_12, alpha = 0.05)
+
+# append the filtered out rows back on
+res_3_12 <- rbind(res_3_12, padj_save)
+res_3_12 <- rbind(res_3_12, pvalue_save)
+```
+
+Get padj values from re-estimated pvalues, plot new p-value distribution, and output. We see here that the p-value distribution is less skewed than before. However, there are much less DE genes so we will stick with the uncorrected model for the rest of the analysis. 
+```{r}
+# plot new p-value historgram
+hist(res_3_12$pvalue, main = "P-value distribution 30 vs 60 minutes", xlab = "P-value", ylab = "Frequency", col = "blue")
+```
+
+## 12 months vs 29 months
+Using original model
+```{r}
+# Extract the 3 months vs 12 months result using an alpha threshold of 0.05
+res_12_29 <- results(dds_filter, alpha = 0.05, contrast = c("ob_ages", "12", "29"))
+
+# p-value distribution histogram
+hist(res_12_29$pvalue, main = "P-value distribution 12 months vs 29 months", xlab = "P-value", ylab = "Frequency", col = "lavender")
+
+# get shrunken fold change
+res <- lfcShrink(dds_filter, contrast = c("ob_ages", "12", "29"), type="normal")
+
+# get a summary of the amount of significantly differentially expressed genes 
+summary(res_12_29, alpha = 0.05)
+    
+# write the results
+writeOutput(res_12_29, dds_filter, "Olfactory_bulb_lfcShrink", c("12", "29"), dir)
+```
+
+P-value correction on 3 months vs 29 months. Doing this because p-val histogram is skewed to the right.
+Clear out genes that were removed via independent filtering, clear out padj values, Re-estimate p-values using z-score
+```{r}
+# save these to append later
+padj_save <- res_12_29[is.na(res_12_29$padj),]
+pvalue_save <- padj_save[is.na(padj_save$pvalue),]
+
+# remove genes filtered out by independent filtering
+res_12_29 <- res_12_29[!is.na(res_12_29$padj),]
+res_12_29 <- res_12_29[!is.na(res_12_29$pvalue),]
+# remove all adjusted pvalues, will replace later
+res_12_29 <- res_12_29[, -which(names(res_12_29) == "padj")]
+# get z-scores_12_29 as input to fdrtool to re-estimte p-values
+FDR.res_12_29 <- fdrtool(res_12_29$stat, statistic = "normal", plot = T)
+# calculate new padj values using BH correction
+res_12_29[, "padj"] <- p.adjust(FDR.res_12_29$pval, method = "BH")
+# put new pvals in res_12_29 object
+res_12_29$pvalue <- FDR.res_12_29$pval
+
+# summary before binding
+summary(res_12_29, alpha = 0.05)
+
+# append the filtered out rows back on
+res_12_29 <- rbind(res_12_29, padj_save)
+res_12_29 <- rbind(res_12_29, pvalue_save)
+```
+
+Get padj values from re-estimated pvalues, plot new p-value distribution, and output. We see here that the p-value distribution is less skewed than before. We use these new results.
+```{r}
+# plot new p-value historgram
+hist(res_12_29$pvalue, main = "P-value distribution 12 vs 29 months", xlab = "P-value", ylab = "Frequency", col = "blue")
+
+# write the results
+writeOutput(res_12_29, dds_filter, "Olfactory_bulb_lfcShrink_FDR_corrected", c("12", "29"), dir)
+```
+
+## 3 months vs 29 months
+Using original model
+```{r}
+# Extract the 3 months vs 12 months result using an alpha threshold of 0.05
+res_3_29 <- results(dds_filter, alpha = 0.05, name = "ob_ages_29_vs_3")
+
+# p-value distribution histogram
+hist(res_3_29$pvalue, main = "P-value distribution 3 months vs 29 months", xlab = "P-value", ylab = "Frequency", col = "lavender")
+
+# get shrunken fold change
+res <- lfcShrink(dds_filter, contrast = c("ob_ages", "3", "29"), type="normal")
+
+# get a summary of the amount of significantly differentially expressed genes 
+summary(res_3_29, alpha = 0.05)
+    
+# write the results
+#writeOutput(res_3_29, dds_filter, "Olfactory_bulb_lfcShrink", c("12", "29"), dir)
+```
+
+P-value correction on 3 months vs 29 months. Doing this because p-val histogram is skewed to the right.
+Clear out genes that were removed via independent filtering, clear out padj values, Re-estimate p-values using z-score
+```{r}
+# save these to append later
+padj_save <- res_3_29[is.na(res_3_29$padj),]
+pvalue_save <- padj_save[is.na(padj_save$pvalue),]
+
+# remove genes filtered out by independent filtering
+res_3_29 <- res_3_29[!is.na(res_3_29$padj),]
+res_3_29 <- res_3_29[!is.na(res_3_29$pvalue),]
+# remove all adjusted pvalues, will replace later
+res_3_29 <- res_3_29[, -which(names(res_3_29) == "padj")]
+# get z-scores_3_29 as input to fdrtool to re-estimte p-values
+FDR.res_3_29 <- fdrtool(res_3_29$stat, statistic = "normal", plot = T)
+# calculate new padj values using BH correction
+res_3_29[, "padj"] <- p.adjust(FDR.res_3_29$pval, method = "BH")
+# put new pvals in res_3_29 object
+res_3_29$pvalue <- FDR.res_3_29$pval
+
+# summary before binding
+summary(res_3_29, alpha = 0.05)
+
+# append the filtered out rows back on
+res_3_29 <- rbind(res_3_29, padj_save)
+res_3_29 <- rbind(res_3_29, pvalue_save)
+```
+
+Get padj values from re-estimated pvalues, plot new p-value distribution, and output. We see here that the p-value distribution is less skewed than before. We use these new results.
+```{r}
+# plot new p-value historgram
+hist(res_3_29$pvalue, main = "P-value distribution 3 vs 29 months", xlab = "P-value", ylab = "Frequency", col = "blue")
+
+# write the results
+writeOutput(res_3_29, dds_filter, "Olfactory_bulb_lfcShrink_FDR_corrected", c("3", "29"), dir)
+```
+
+# DESeq Time course analysis
+Using the likelihood ratio test, we are able to test for genes which change significantly over the timecourse of the experiment. This will test whether the increase in the log likelihood from the additional coefficients in the time factor would be expected if those coefficients were equal to zero. If the adjusted p-value is small, then for the set of genes with those small adjusted p-values, the additional coefficient in full and not in reduced increased the log likelihood more than would be expected if their true value was zero. This is useful to get the genes which significantly vary over time. We use a reduced model here of ~1 where we remove the effects of time in order to compare against.
+```{r}
+ddsTC <- DESeq(dds_filter, test = "LRT", reduced = ~1)
+```
+
+Getting results for time-course data. These are any of the genes that were found to significantly vary over the time course of the experiment.
+```{r}
+resTC <- results(ddsTC, alpha = 0.05)
+summary(resTC, alpha = 0.05)
+
+writeOutput(resTC, ddsTC, "Olfactory_bulb", "LRT", dir)
+```
+
+Plotting gene with lowest padj value - It is Prokr2 which decreases with age
+```{r}
+# gene with lowest padj to plot 
+row.names(ddsTC)[which.min(resTC$padj)]
+
+# extracting count data and variables for the most significant time course DE gene
+dat <- plotCounts(ddsTC, which.min(resTC$padj), 
+                   intgroup = "ob_ages", returnData = TRUE, Normalized = TRUE)
+
+# ordering from lowest to highest time point
+dat <- dat[order(dat$ob_ages),]
+
+ggplot(dat, aes(x = as.numeric(ob_ages), y = count)) + 
+  geom_point() +
+  geom_smooth(se = FALSE, method = "loess") +
+  scale_y_continuous(trans = "log2")
+```
+
+Plot the 25 lowest genes with p-values.
+```{r}
+# getting the counts for the top 10 SDE genes 
+dat_10 <- melt(counts(ddsTC[head(order(resTC$padj), 25),], normalized = TRUE), id = row.names)
+
+# adding a time variable to the dataframe, this has to be in the same order
+dat_10$time <- factor(c(rep(c(3), each = 75), rep(c(12), each = 50), rep(c(29), each = 75)))
+
+# reordering based on the time
+dat_10 <- dat_10[order(dat_10$time),]
+
+# setting the gene names to a factor, which will allow grouping
+dat_10$Var1 <- as.factor(dat_10$Var1)
+
+ggplot(dat_10, aes(x = time, y = value, color = Var1, group = Var1)) + 
+  geom_point() +
+  geom_smooth(se = FALSE, method = "loess") +
+  scale_y_continuous(trans = "log1p") +
+  theme(legend.position="none")
+```
+
+4. Continuous changes in variability - creating model 
+```{r}
+
+```
+
+Gene expression variability - here we are looking at the varibility between biological replicates. This means that we could be seeing differences because of different cell compositions in bulk tissue or if we assume cell composition is unchanged, this could be the dyssynchrony of the cells (within the same cell type) in the bulk sample. 
+
+Since we are using residuals or IQR to measure gene expression variability, this means that high variability means expression that is far from the predicted expression level. Biologically, this means unpredictability in expression at a specific age.
+
+However, this was already tested on this data using cibersort, where cell composition was not found to be changing. If we have cells we could look at the variability between cells over time which would tell us about increased/decreased tissue heterogeneity throughout aging. 
+
+4. Continuous changes in variability - time continuous model. Create linear model of gene expression variability as a function of age. Run a spearman-correlation between the abs residuals and the age of samples. Then look at distribution of spearman coefficients. Finally see if there is a postivie correlation (or in which subset of genes) using wilcoxon test. 
+
+change in variability = spearman(abs(residuals), age)
+
+5. Grouped changes in variability - compare between 3 time points. Get interquartile range of gene expression for each gene across 3 time points. Get change of IQR by using fractions of IQR. Use wilcox test to test if fractions are different from zero for each gene. Generate null distribution of residuals from young group (control) using bootstrapping to obtain p-value??? IQR corresponds to the difference between the 75th and 25th percentiles of the distribution and is considered to be a robust measure of variability, meaning it is not susceptible to outliers and departure from normality in the data
+
+change in variability = (IQR old - IQR young)/IQR young
+
+5.5. Check if expression variability is confounded by expression level (fisher's test). If so, transform data using voom.
+
+6.1. Test for global changes in expression variability 
+
+6.2. Test for changes in expression variability at the gene level with multiple hypothesis corrections
+
+7. Pathwya enrichment using GO and GSEA 
+
+8. correlation between the pathway membership of gene and its variability measure
+
+
 
