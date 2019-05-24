@@ -11,6 +11,9 @@ knitr::opts_chunk$set(echo = TRUE)
 
 The purpose of this is to use methods developed in, Kedlian, V. R., Donertas, H. M., & Thornton, J. M. (2019). The widespread increase in inter-individual variability of gene expression in the human brain with age. Aging, 11(8). https://doi.org/10.18632/aging.101912, and apply them to the datasets presented in Benayoun, B. A., Pollina, E. A., Singh, P. P., Mahmoudi, S., Harel, I., Casey, K. M., … Brunet, A. (2019). Remodeling of epigenome and transcriptome landscapes with aging in mice reveals widespread induction of inflammatory responses. Genome Research, 29(4), 697–709. https://doi.org/10.1101/gr.240093.118.
 
+Could also create protein-protein interaction network and then look at network perturbations using differential variability analysis: https://bmcresnotes.biomedcentral.com/articles/10.1186/1756-0500-6-430
+
+
 ## Load libraries
 ```{r}
 colors <- c("#A7A7A7",
@@ -31,6 +34,7 @@ library(fdrtool)
 library(reshape2)
 library(RColorBrewer)
 library(sva)
+library("biomaRt")
 ```
 
 
@@ -325,6 +329,64 @@ ddssva_default$condition <- relevel(ddssva_default$ob_ages, ref = "3")
 ddssva_default <- DESeq(ddssva_default)
 ```
 
+Variance stabalizing transformation. Setting blind = TRUE because we do not want to bias this with information from the design.
+```{r}
+ddssva_default_vst <- vst(ddssva_default, blind = TRUE)
+```
+
+Switching out vst counts for batch corrected counts by limma to plot PCA that displays batch correction. Also getting normalized and unormalized batch corrected counts for downstream processing.
+```{r}
+ddssva_default_vst_limma <- ddssva_default_vst
+ddssva_default_vst_limma_condition <- ddssva_default_vst
+
+# this simply removes any shifts in the log2-scale expression data that is adjusted for according to sva covariates
+assay(ddssva_default_vst_limma) <- limma::removeBatchEffect(assay(ddssva_default_vst), covariates = colData(ddssva_default_vst)[,c(2:3)])
+
+# attempting to account for conditions
+assay(ddssva_default_vst_limma_condition) <- limma::removeBatchEffect(assay(ddssva_default_vst), covariates = colData(ddssva_default_vst)[,c(2:3)], design = model.matrix(~ob_ages, colData(ddssva_default)))
+
+# to keep colData and such for processing below 
+ddssva_default_noramlized <- ddssva_default
+ddssva_default_unnoramlized <- ddssva_default
+ddssva_default_noramlized_counts_vst <- ddssva_default_vst
+ddssva_default_unnoramlized_counts_vst <- ddssva_default_vst
+
+# using normalized counts instead for plotting gene expression
+ddssva_default_noramlized_counts <- limma::removeBatchEffect(counts(ddssva_default, normalized = TRUE), covariates = colData(ddssva_default_vst)[,c(2:3)], design = model.matrix(~ob_ages, colData(ddssva_default)))
+ddssva_default_noramlized_counts[ddssva_default_noramlized_counts < 0] <- 0 # remove zeros 
+ddssva_default_noramlized_counts <- round(ddssva_default_noramlized_counts) # convert to integers 
+assay(ddssva_default_noramlized) <- ddssva_default_noramlized_counts
+assay(ddssva_default_noramlized_counts_vst) <- vst(ddssva_default_noramlized_counts, blind = TRUE)
+
+# using unnormalized counts instead for later transformation
+ddssva_default_unnoramlized_counts <- limma::removeBatchEffect(counts(ddssva_default, normalized = FALSE), covariates = colData(ddssva_default_vst)[,c(2:3)], design = model.matrix(~ob_ages, colData(ddssva_default)))
+ddssva_default_unnoramlized_counts[ddssva_default_unnoramlized_counts < 0] <- 0 # remove zeros 
+ddssva_default_unnoramlized_counts <- round(ddssva_default_unnoramlized_counts) # convert to integers 
+assay(ddssva_default_unnoramlized) <- ddssva_default_unnoramlized_counts
+assay(ddssva_default_unnoramlized_counts_vst) <- vst(ddssva_default_unnoramlized_counts, blind = TRUE)
+```
+
+PCA plot and plot of eigenvalues for each PCA showing how much each account for total variance. It appears that the SVA correction has the groups nicely plotted together and that age seems to be accounted for by PC1. 
+```{r}
+PCA <- PCAPlotter(5000, dds_vst, 16)
+PCA <- PCAPlotter(5000, ddssva_default_vst_limma, 16)
+PCA <- PCAPlotter(5000, ddssva_default_noramlized_counts_vst, 16)
+PCA <- PCAPlotter(5000, ddssva_default_unnoramlized_counts_vst, 16)
+PCA <- PCAPlotter(5000, ddssva_default_vst_limma_condition, 16)
+
+# get importance of each component
+fviz_eig(PCA, addlabels = TRUE)
+
+var <- get_pca_var(PCA)
+# contributions of individual genes to each PC
+fviz_contrib(PCA, choice = "var", axes = 1, top = 20, rotate = TRUE, sort.val = "asc")
+fviz_contrib(PCA, choice = "var", axes = 2, top = 20, rotate = TRUE, sort.val = "asc")
+
+# contributions of individual samples to each PC 
+fviz_contrib(PCA, choice = "ind", axes = 1, top = 20, rotate = TRUE, sort.val = "asc")
+fviz_contrib(PCA, choice = "ind", axes = 2, top = 20, rotate = TRUE, sort.val = "asc")
+```
+
 # Differential Expression Results
 
 ## Results Names
@@ -582,8 +644,203 @@ ggplot(dat_10, aes(x = time, y = value, color = Var1, group = Var1)) +
   theme(legend.position="none")
 ```
 
-4. Continuous changes in variability - creating model 
+4. Continuous changes in variability - creating model. Note that this model is confounded by the lack of sampling of different ages.
 ```{r}
+# norammalized counts transformed to melted matrix
+ob_counts <- counts(dds_filter, normalized = TRUE)
+
+# fit a linear model for each gene and get residuals 
+ob_counts_lm <- list()
+ob_ages_numeric <- c(3,  3,  3,  12, 12, 29, 29, 29)
+
+for(gene in row.names(ob_counts)){
+  temp <- melt(ob_counts[gene,])
+  temp$age <- ob_ages_numeric
+  ob_counts_lm[[gene]] <- lm(value ~ age, data = temp)$residuals
+}
+ob_lm_residuals <- do.call(rbind, ob_counts_lm)
+
+# plot residuals for all genes for each age 
+ob_lm_residuals_melt <- ob_lm_residuals
+colnames(ob_lm_residuals_melt) <- ob_ages_numeric
+ob_lm_residuals_melt <- melt(ob_lm_residuals_melt)
+
+ggplot(ob_lm_residuals_melt, aes(x = Var2, y = log(value + 1))) + 
+  geom_point() +
+  stat_smooth(method = "lm", col = "red") +
+  ggtitle("Residuals as a function of Age")
+```
+
+Calculate Spearman correlation between the absolute values of the residuals and age for each gene. Note that here spearman's correlation cannot calculate an exact p-value in the presence of rank ties. We can suppress this warning by using the 'exact = FALSE' parameter. Alternatively we can also use Kendall's Tau-b, which is able to handle ties. The tau-b statistic handles ties (i.e., both members of the pair have the same ordinal value) by a divisor term, which represents the geometric mean between the number of pairs not tied on x and the number not tied on y. 
+
+It appears that p-values here are binned and that they are not distributed as we would expect, which may warrant FDR correction. We also see that adjustment for multiple hypothesis testing drives all of our p-values very high.
+
+Overall, there are no significant correlates of residuals with age after multiple hypothesis correction.
+```{r}
+# spearman change in variability with age
+ob_var_spearman_list <- list()
+for(gene in row.names(ob_lm_residuals)){
+  temp <- cor.test(x = abs(ob_lm_residuals[gene,]), y = ob_ages_numeric, method = "spearman", exact = FALSE)
+  ob_var_spearman_list[[gene]] <- c(temp$estimate, temp$p.value)
+}
+ob_var_spearman <- as.data.frame(do.call(rbind, ob_var_spearman_list))
+
+# kendalls change in variability with age
+ob_var_kendall_list <- list()
+for(gene in row.names(ob_lm_residuals)){
+  temp <- cor.test(x = abs(ob_lm_residuals[gene,]), y = ob_ages_numeric, method = "kendall", exact = FALSE)
+  ob_var_kendall_list[[gene]] <- c(temp$estimate, temp$p.value)
+}
+ob_var_kendall <- as.data.frame(do.call(rbind, ob_var_kendall_list))
+
+# multiple hypothesis correction
+ob_var_spearman$padj <- p.adjust(ob_var_spearman[,2], method = "BH")
+ob_var_kendall$padj <- p.adjust(ob_var_kendall[,2], method = "BH")
+
+# distribution of p-values and padj
+hist(ob_var_spearman$V2)
+hist(ob_var_spearman$padj)
+hist(ob_var_kendall$V2)
+hist(ob_var_kendall$padj)
+```
+
+Distribution of spearman and kendall estimates and fit to normal distirbution. Neither fit a normal distribution.
+```{r}
+# spearman 
+hist(ob_var_spearman$rho)
+shapiro.test(sample(ob_var_spearman$rho, size = 5000))
+# kendall
+hist(ob_var_kendall$tau)
+shapiro.test(sample(ob_var_kendall$tau, size = 5000))
+```
+
+Check if residuals correlate with expression level. Significant but weak correlation.
+```{r}
+plot(ob_lm_residuals ~ ob_counts)
+cor.test(x = ob_lm_residuals, y = ob_counts)
+```
+
+Significant differentially variable genes. None 
+```{r}
+ob_var_spearman_sig <- ob_var_spearman[ob_var_spearman$padj < 0.05,]
+ob_var_kendall_sig <- ob_var_kendall[ob_var_kendall$padj < 0.05,]
+```
+
+Grouped changes in variability - compare between 3 time points. Get interquartile range of gene expression for each gene within each time point across replicates. Get change of IQR by using fold change of IQR. Use wilcox test to test if fractions are different from zero for each gene. Generate null distribution of differences of IQR using bootstrapping. IQR corresponds to the difference between the 75th and 25th percentiles of the distribution and is considered to be a robust measure of variability, meaning it is not susceptible to outliers and departure from normality in the data.
+
+change in variability = log2(IQR old/IQR young)
+
+Get IQR for each gene within each time point normalized for expression level. 
+```{r}
+# get IQR for each gene at each time point 
+ob_IQR_temp <- list()
+for(gene in row.names(ob_counts)){
+  temp <- melt(ob_counts[gene,])
+  temp$age <- ob_ages_numeric
+  ob_IQR_temp[[gene]] <- c(IQR(subset(temp, age == 3)$value)/mean(subset(temp, age == 3)$value), IQR(subset(temp, age == 12)$value)/mean(subset(temp, age == 12)$value), IQR(subset(temp, age == 29)$value)/mean(subset(temp, age == 29)$value))
+  #quantile(x, 3/4) - quantile(x, 1/4)
+}
+ob_IQR <- as.data.frame(do.call(rbind, ob_IQR_temp))
+colnames(ob_IQR) <- c(3,12,29)
+
+# check if distirbutions are different from each other
+wilcox.test(ob_IQR$`3`, ob_IQR$`12`)
+wilcox.test(ob_IQR$`12`, ob_IQR$`29`)
+wilcox.test(ob_IQR$`3`, ob_IQR$`29`)
+
+# plot
+ggplot(melt(ob_IQR), aes(x = log(value), color = variable)) +
+  geom_density(fill="white", alpha=0.5, position="identity")
+ggplot(melt(ob_IQR), aes(x = log(value), color = variable)) +
+  geom_histogram(fill="white", alpha=0.5, position="identity")
+```
+
+calculated significance as a percentage of samples where IQRold was more extreme than IQRyoung and corrected it for multiple testing using FDR correction, q ≤ 0.05.
+```{r}
+# change in variability 3 vs 12 
+ob_IQR_3_12 <- as.data.frame(log2(ob_IQR$`12`/ob_IQR$`3`))
+
+# bootstrapping to create null distribution
+ob_IQR_3_12_null <- rep(NA, 10000)
+ob_IQR_3_12_combined <- c(ob_IQR$`12`, ob_IQR$`3`)
+for(x in 1:10000){
+  ob_IQR_3_12_null[x] <- log2(sample(ob_IQR_3_12_combined, replace = TRUE, size = 1)/sample(ob_IQR_3_12_combined, replace = TRUE, size = 1))
+}
+hist(ob_IQR_3_12_null)
+
+# p-value 
+p <- rep(NA, length(ob_IQR_3_12[,1]))
+for(x in 1:length(ob_IQR_3_12[,1])){
+  p[x] <- (sum(ob_IQR_3_12_null >= ob_IQR_3_12[x,1], na.rm = TRUE) + sum(ob_IQR_3_12_null <= -ob_IQR_3_12[x,1], na.rm = TRUE)) / 20000
+}
+ob_IQR_3_12$pval <- p
+
+# adjusted p-value
+ob_IQR_3_12$padj <- p.adjust(p, method = "BH")
+
+
+# change in variability 12 vs 29
+ob_IQR_12_29 <- as.data.frame(log2(ob_IQR$`29`/ob_IQR$`12`))
+
+# bootstrapping to create null distribution
+ob_IQR_12_29_null <- rep(NA, 10000)
+ob_IQR_12_29_combined <- c(ob_IQR$`12`, ob_IQR$`29`)
+for(x in 1:10000){
+  ob_IQR_12_29_null[x] <- log2(sample(ob_IQR_12_29_combined, replace = TRUE, size = 1)/sample(ob_IQR_12_29_combined, replace = TRUE, size = 1))
+}
+hist(ob_IQR_12_29_null)
+
+# p-value 
+p <- rep(NA, length(ob_IQR_12_29[,1]))
+for(x in 1:length(ob_IQR_12_29[,1])){
+  p[x] <- (sum(ob_IQR_12_29_null >= ob_IQR_12_29[x,1], na.rm = TRUE) + sum(ob_IQR_12_29_null <= -ob_IQR_12_29[x,1], na.rm = TRUE)) / 20000
+}
+ob_IQR_12_29$pval <- p
+
+# adjusted p-value
+ob_IQR_12_29$padj <- p.adjust(p, method = "BH")
+
+# change in variability 3 vs 29
+ob_IQR_3_29 <- as.data.frame(log2(ob_IQR$`29`/ob_IQR$`3`))
+
+# bootstrapping to create null distribution
+ob_IQR_3_29_null <- rep(NA, 10000)
+ob_IQR_3_29_combined <- c(ob_IQR$`3`, ob_IQR$`29`)
+for(x in 1:10000){
+  ob_IQR_3_29_null[x] <- log2(sample(ob_IQR_3_29_combined, replace = TRUE, size = 1)/sample(ob_IQR_3_29_combined, replace = TRUE, size = 1))
+}
+hist(ob_IQR_3_29_null)
+
+# p-value 
+p <- rep(NA, length(ob_IQR_3_29[,1]))
+for(x in 1:length(ob_IQR_3_29[,1])){
+  p[x] <- (sum(ob_IQR_3_29_null >= ob_IQR_3_29[x,1], na.rm = TRUE) + sum(ob_IQR_3_29_null <= -ob_IQR_3_29[x,1], na.rm = TRUE)) / 20000
+}
+ob_IQR_12_29$pval <- p
+
+# adjusted p-value
+ob_IQR_3_29$padj <- p.adjust(p, method = "BH")
+```
+
+Check if IQR correlates with expression level. There is a significant correlation but it is very small.
+```{r}
+ob_counts_avg <- data.frame("3" = rowMeans(ob_counts[,c(1:3)]),  "12" = rowMeans(ob_counts[,c(4:5)]), "29" = rowMeans(ob_counts[,c(6:8)]))
+ob_IQR_df <- as.data.frame(ob_IQR)
+plot(melt(ob_IQR_df)$value ~ melt(ob_counts_avg)$value)
+cor.test(x = melt(ob_IQR_df)$value, y = melt(ob_counts_avg)$value)
+```
+
+Significant differentially variable genes. None 
+```{r}
+ob_IQR_3_12 <- ob_IQR_3_12[ob_IQR_3_12$padj < 0.05,]
+ob_IQR_12_29 <- ob_IQR_12_29[ob_IQR_12_29$padj < 0.05,]
+ob_IQR_3_29 <- ob_IQR_3_29[ob_IQR_3_29$padj < 0.05,]
+```
+
+
+# Gene set enrichment
+```{r}
+# get more info for each gene
 
 ```
 
